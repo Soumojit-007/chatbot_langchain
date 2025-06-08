@@ -83,8 +83,6 @@
 #     except Exception as e:
 #         st.error(f"❌ Failed to process the file: {e}")
 
-
-
 import streamlit as st
 from dotenv import load_dotenv
 from PyPDF2 import PdfReader
@@ -99,10 +97,16 @@ from langchain.chains.summarize import load_summarize_chain
 from langchain.prompts import PromptTemplate
 import time
 from datetime import datetime
+import traceback
 
 # Load environment variables
 load_dotenv()
-api_key = os.getenv("GOOGLE_API_KEY")
+
+# Get API key from environment or Streamlit secrets
+try:
+    api_key = st.secrets["GOOGLE_API_KEY"] if "GOOGLE_API_KEY" in st.secrets else os.getenv("GOOGLE_API_KEY")
+except:
+    api_key = os.getenv("GOOGLE_API_KEY")
 
 # Page configuration
 st.set_page_config(
@@ -174,20 +178,51 @@ if 'document_processed' not in st.session_state:
     st.session_state.document_processed = False
 if 'document_stats' not in st.session_state:
     st.session_state.document_stats = {}
+if 'docs' not in st.session_state:
+    st.session_state.docs = []
+if 'qa_chain' not in st.session_state:
+    st.session_state.qa_chain = None
+if 'summarization_chain' not in st.session_state:
+    st.session_state.summarization_chain = None
+if 'llm_initialized' not in st.session_state:
+    st.session_state.llm_initialized = False
 
-# Initialize the LLM
-@st.cache_resource
+# Initialize the LLM with error handling
 def initialize_llm():
-    return ChatGoogleGenerativeAI(
-        model="gemini-1.5-flash",
-        google_api_key=api_key
-    )
+    try:
+        if not api_key:
+            st.error("❌ Google API Key not found. Please check your environment variables or Streamlit secrets.")
+            return None
+        
+        llm = ChatGoogleGenerativeAI(
+            model="gemini-1.5-flash",
+            google_api_key=api_key,
+            temperature=0.3,
+            max_tokens=2048,
+            timeout=60  # Add timeout for deployment
+        )
+        
+        # Test the LLM with a simple query
+        test_response = llm.invoke("Hello")
+        st.session_state.llm_initialized = True
+        return llm
+    except Exception as e:
+        st.error(f"❌ Failed to initialize LLM: {str(e)}")
+        st.session_state.llm_initialized = False
+        return None
 
-try:
-    llm = initialize_llm()
-    llm_status = "✅ Connected"
-except:
-    llm_status = "❌ Connection Failed"
+# Initialize LLM only once
+if not st.session_state.llm_initialized:
+    with st.spinner("🔄 Initializing AI model..."):
+        llm = initialize_llm()
+else:
+    llm = ChatGoogleGenerativeAI(
+        model="gemini-1.5-flash",
+        google_api_key=api_key,
+        temperature=0.3,
+        max_tokens=2048,
+        timeout=60
+    )
 
 # Sidebar
 with st.sidebar:
@@ -196,6 +231,7 @@ with st.sidebar:
     
     # System Status
     st.subheader("🔍 System Status")
+    llm_status = "✅ Connected" if st.session_state.llm_initialized else "❌ Connection Failed"
     st.markdown(f"**LLM Status:** {llm_status}")
     st.markdown(f"**Session Time:** {datetime.now().strftime('%H:%M:%S')}")
     
@@ -227,6 +263,12 @@ st.markdown("""
     <p>Upload, Analyze, and Chat with your Documents using Google Gemini</p>
 </div>
 """, unsafe_allow_html=True)
+
+# Check if LLM is properly initialized
+if not st.session_state.llm_initialized:
+    st.error("⚠️ AI model not initialized. Please check your API key configuration.")
+    st.info("💡 Make sure to add your GOOGLE_API_KEY to Streamlit secrets or environment variables.")
+    st.stop()
 
 # Feature overview
 col1, col2, col3 = st.columns(3)
@@ -264,8 +306,12 @@ uploaded_file = st.file_uploader(
 )
 
 def extract_text_from_docx(file):
-    doc = docx.Document(file)
-    return "\n".join([para.text for para in doc.paragraphs])
+    try:
+        doc = docx.Document(file)
+        return "\n".join([para.text for para in doc.paragraphs])
+    except Exception as e:
+        st.error(f"Error reading DOCX file: {str(e)}")
+        return ""
 
 def calculate_stats(text, chunks):
     words = len(text.split())
@@ -282,22 +328,43 @@ if uploaded_file is not None:
             # Extract text from file
             text = ""
             if uploaded_file.name.endswith(".pdf"):
-                pdf_reader = PdfReader(io.BytesIO(uploaded_file.read()))
-                pages = len(pdf_reader.pages)
-                for page in pdf_reader.pages:
-                    text += page.extract_text() or ""
+                try:
+                    pdf_reader = PdfReader(io.BytesIO(uploaded_file.read()))
+                    pages = len(pdf_reader.pages)
+                    for page in pdf_reader.pages:
+                        page_text = page.extract_text()
+                        if page_text:
+                            text += page_text
+                except Exception as e:
+                    st.error(f"Error reading PDF: {str(e)}")
+                    st.stop()
             elif uploaded_file.name.endswith(".docx"):
                 text = extract_text_from_docx(uploaded_file)
                 pages = "N/A"
+            
+            if not text.strip():
+                st.error("❌ No text could be extracted from the document. Please check the file.")
+                st.stop()
 
-            # Split into chunks
-            text_splitter = CharacterTextSplitter(
-                separator="\n", 
-                chunk_size=chunk_size, 
-                chunk_overlap=chunk_overlap
-            )
-            texts = text_splitter.split_text(text)
-            docs = [Document(page_content=chunk) for chunk in texts]
+            # Split into chunks with error handling
+            try:
+                text_splitter = CharacterTextSplitter(
+                    separator="\n", 
+                    chunk_size=chunk_size, 
+                    chunk_overlap=chunk_overlap
+                )
+                texts = text_splitter.split_text(text)
+                
+                if not texts:
+                    st.error("❌ Could not split document into chunks. Please try a different document.")
+                    st.stop()
+                
+                docs = [Document(page_content=chunk) for chunk in texts]
+                st.session_state.docs = docs
+                
+            except Exception as e:
+                st.error(f"Error splitting text: {str(e)}")
+                st.stop()
 
             # Calculate statistics
             stats = calculate_stats(text, texts)
@@ -306,20 +373,25 @@ if uploaded_file is not None:
             st.session_state.document_stats = stats
             st.session_state.document_processed = True
 
-            # QA Chain (unchanged)
-            qa_chain = load_qa_chain(llm, chain_type="stuff")
+            # Initialize chains with error handling
+            try:
+                # QA Chain with timeout handling
+                st.session_state.qa_chain = load_qa_chain(llm, chain_type="stuff")
 
-            # Custom prompt for summarization
-            custom_prompt = PromptTemplate(
-                input_variables=["text"],
-                template="Summarize the following document focusing on the main points:\n\n{text}\n\nSummary:"
-            )
+                # Custom prompt for summarization
+                custom_prompt = PromptTemplate(
+                    input_variables=["text"],
+                    template="Summarize the following document focusing on the main points:\n\n{text}\n\nSummary:"
+                )
 
-            # Summarization chain with custom prompt
-            summarization_chain = load_summarize_chain(
-                llm, chain_type="stuff",
-                prompt=custom_prompt
-            )
+                # Summarization chain with custom prompt
+                st.session_state.summarization_chain = load_summarize_chain(
+                    llm, chain_type="stuff",
+                    prompt=custom_prompt
+                )
+            except Exception as e:
+                st.error(f"Error initializing chains: {str(e)}")
+                st.stop()
 
         # Success message
         st.markdown(f"""
@@ -347,24 +419,32 @@ if uploaded_file is not None:
             with col1:
                 ask_button = st.button("🚀 Ask Question", use_container_width=True)
             
-            if ask_button and query:
-                with st.spinner("🤔 Thinking... Please wait"):
-                    start_time = time.time()
-                    response = qa_chain.invoke({
-                        "input_documents": docs,
-                        "question": query
-                    })
-                    end_time = time.time()
+            if ask_button and query and st.session_state.qa_chain:
+                try:
+                    with st.spinner("🤔 Thinking... Please wait"):
+                        start_time = time.time()
+                        
+                        # Add timeout handling for the query
+                        response = st.session_state.qa_chain.invoke({
+                            "input_documents": st.session_state.docs,
+                            "question": query
+                        })
+                        
+                        end_time = time.time()
+                        
+                        # Add to chat history
+                        st.session_state.chat_history.append({
+                            "question": query,
+                            "answer": response["output_text"],
+                            "timestamp": datetime.now().strftime("%H:%M:%S"),
+                            "processing_time": f"{end_time - start_time:.2f}s"
+                        })
                     
-                    # Add to chat history
-                    st.session_state.chat_history.append({
-                        "question": query,
-                        "answer": response["output_text"],
-                        "timestamp": datetime.now().strftime("%H:%M:%S"),
-                        "processing_time": f"{end_time - start_time:.2f}s"
-                    })
-                
-                st.rerun()
+                    st.rerun()
+                    
+                except Exception as e:
+                    st.error(f"❌ Error processing question: {str(e)}")
+                    st.info("💡 Try rephrasing your question or check your internet connection.")
             
             # Display chat history
             if st.session_state.chat_history:
@@ -387,24 +467,32 @@ if uploaded_file is not None:
                 )
             
             if st.button("📋 Generate Summary", use_container_width=True):
-                with st.spinner("📝 Generating summary... This may take a moment"):
-                    start_time = time.time()
-                    summary = summarization_chain.run(docs)
-                    end_time = time.time()
-                    
-                    st.markdown("### 📌 Document Summary")
-                    st.markdown(f"**Summary Type:** {summary_type}")
-                    st.markdown(f"**Generated in:** {end_time - start_time:.2f} seconds")
-                    st.markdown("---")
-                    st.write(summary)
-                    
-                    # Download summary option
-                    st.download_button(
-                        label="📥 Download Summary",
-                        data=summary,
-                        file_name=f"summary_{uploaded_file.name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
-                        mime="text/plain"
-                    )
+                if st.session_state.summarization_chain:
+                    try:
+                        with st.spinner("📝 Generating summary... This may take a moment"):
+                            start_time = time.time()
+                            
+                            # Add timeout and error handling for summarization
+                            summary = st.session_state.summarization_chain.run(st.session_state.docs)
+                            
+                            end_time = time.time()
+                            
+                            st.markdown("### 📌 Document Summary")
+                            st.markdown(f"**Summary Type:** {summary_type}")
+                            st.markdown(f"**Generated in:** {end_time - start_time:.2f} seconds")
+                            st.markdown("---")
+                            st.write(summary)
+                            
+                            # Download summary option
+                            st.download_button(
+                                label="📥 Download Summary",
+                                data=summary,
+                                file_name=f"summary_{uploaded_file.name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+                                mime="text/plain"
+                            )
+                    except Exception as e:
+                        st.error(f"❌ Error generating summary: {str(e)}")
+                        st.info("💡 Try again or check your internet connection.")
 
         with tab3:
             st.subheader("📊 Document Analysis")
@@ -460,7 +548,8 @@ if uploaded_file is not None:
                 st.metric("Smallest Chunk", f"{min(chunk_sizes)} characters")
 
     except Exception as e:
-        st.error(f"❌ Failed to process the file: {e}")
+        st.error(f"❌ Failed to process the file: {str(e)}")
+        st.error(f"Debug info: {traceback.format_exc()}")
         st.info("💡 Please make sure your file is not corrupted and try again.")
 
 else:
