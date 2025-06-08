@@ -1,0 +1,5 @@
+langchain
+streamlit
+python-dotenv
+langchain-google-genai
+pypdf2==3.0.1
